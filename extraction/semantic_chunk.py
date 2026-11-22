@@ -81,6 +81,18 @@ class SemanticBoundary:
     threshold: float
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticChunk:
+    chunk_id: str
+    source: str
+    text: str
+    pages: list[int]
+    start_page: int
+    end_page: int
+    char_count: int
+    sentence_count: int
+
+
 def read_page_records(
     input_path: str | Path = DEFAULT_INPUT_PATH,
 ) -> Iterator[PageRecord]:
@@ -476,3 +488,216 @@ def detect_semantic_boundaries(
             )
 
     return boundaries
+
+
+def _joined_sentence_length(sentences: list[SentenceRecord]) -> int:
+    return len(" ".join(sentence.text.strip() for sentence in sentences))
+
+
+def _boundary_positions(
+    sentences: list[SentenceRecord],
+    boundaries: list[SemanticBoundary],
+) -> dict[int, SemanticBoundary]:
+    positions: dict[int, SemanticBoundary] = {}
+
+    for sentence_index in range(1, len(sentences)):
+        first = sentences[sentence_index - 1]
+        second = sentences[sentence_index]
+
+        for boundary in boundaries:
+            if (
+                boundary.first_sentence == first
+                and boundary.second_sentence == second
+            ):
+                positions[sentence_index] = boundary
+                break
+
+    return positions
+
+
+def _overlap_sentences(
+    previous_sentences: list[SentenceRecord],
+    overlap: int,
+) -> list[SentenceRecord]:
+    if overlap <= 0 or not previous_sentences:
+        return []
+
+    selected_reversed: list[SentenceRecord] = []
+    selected_length = 0
+
+    for sentence in reversed(previous_sentences):
+        sentence_length = len(sentence.text.strip())
+        separator_length = 1 if selected_reversed else 0
+        if selected_length + separator_length + sentence_length > overlap:
+            break
+
+        selected_reversed.append(sentence)
+        selected_length += separator_length + sentence_length
+
+    return list(reversed(selected_reversed))
+
+
+def build_semantic_chunks(
+    sentences: list[SentenceRecord],
+    boundaries: list[SemanticBoundary],
+    min_size: int,
+    max_size: int,
+    overlap: int,
+) -> list[SemanticChunk]:
+    """Build semantic chunks without splitting individual sentences."""
+    if not sentences:
+        return []
+
+    for name, value in (
+        ("min_size", min_size),
+        ("max_size", max_size),
+        ("overlap", overlap),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+        if value < 0:
+            raise ValueError(f"{name} must be greater than or equal to 0")
+
+    if min_size > max_size:
+        raise ValueError("min_size must be less than or equal to max_size")
+    if overlap >= max_size:
+        raise ValueError("overlap must be smaller than max_size")
+
+    source = sentences[0].source
+    if any(sentence.source != source for sentence in sentences):
+        raise ValueError("All sentences must belong to the same source document")
+
+    boundary_by_position = _boundary_positions(sentences, boundaries)
+    core_chunks: list[tuple[int, int]] = []
+    start = 0
+
+    while start < len(sentences):
+        end = start + 1
+
+        while end <= len(sentences):
+            candidate_sentences = sentences[start:end]
+            candidate_length = _joined_sentence_length(candidate_sentences)
+            candidate_count = end - start
+
+            if candidate_count == 1 and candidate_length > max_size:
+                break
+
+            if candidate_length >= max_size:
+                available_boundaries = [
+                    position
+                    for position in boundary_by_position
+                    if start < position <= end
+                ]
+                valid_boundaries = [
+                    position
+                    for position in available_boundaries
+                    if position - start > 0
+                    and _joined_sentence_length(
+                        sentences[start:position]
+                    ) >= min_size
+                    and _joined_sentence_length(
+                        sentences[start:position]
+                    ) <= max_size
+                ]
+
+                if valid_boundaries:
+                    split_at = min(
+                        valid_boundaries,
+                        key=lambda position: (
+                            boundary_by_position[position].score,
+                            -position,
+                        ),
+                    )
+                else:
+                    split_at = None
+                    for position in range(end - 1, start, -1):
+                        if _joined_sentence_length(
+                            sentences[start:position]
+                        ) >= min_size:
+                            split_at = position
+                            break
+
+                if split_at is None:
+                    split_at = end
+
+                end = split_at
+                break
+
+            if (
+                end in boundary_by_position
+                and candidate_length >= min_size
+                and end < len(sentences)
+            ):
+                break
+
+            if end == len(sentences):
+                break
+
+            end += 1
+
+        if end <= start:
+            end = start + 1
+
+        core_chunks.append((start, end))
+        start = end
+
+    core_chunks = [
+        chunk
+        for chunk in core_chunks
+        if chunk[0] < chunk[1]
+    ]
+
+    if len(core_chunks) > 1:
+        final_start, final_end = core_chunks[-1]
+        final_length = _joined_sentence_length(
+            sentences[final_start:final_end]
+        )
+
+        if final_length < min_size:
+            previous_start, previous_end = core_chunks[-2]
+            merged_length = _joined_sentence_length(
+                sentences[previous_start:final_end]
+            )
+
+            if merged_length <= max_size:
+                core_chunks[-2:] = [(previous_start, final_end)]
+
+    document_stem = Path(source).stem
+    output: list[SemanticChunk] = []
+
+    for chunk_index, (start, end) in enumerate(core_chunks, start=1):
+        core_sentences = sentences[start:end]
+        emitted_sentences = list(core_sentences)
+
+        if chunk_index > 1:
+            previous_start, previous_end = core_chunks[chunk_index - 2]
+            previous_sentences = sentences[previous_start:previous_end]
+            emitted_sentences = (
+                _overlap_sentences(previous_sentences, overlap)
+                + emitted_sentences
+            )
+
+        text = " ".join(
+            sentence.text.strip()
+            for sentence in emitted_sentences
+            if sentence.text.strip()
+        )
+        pages = sorted({
+            sentence.page
+            for sentence in emitted_sentences
+        })
+
+        output.append(
+            SemanticChunk(
+                chunk_id=f"{document_stem}-semantic-{chunk_index:06d}",
+                source=source,
+                text=text,
+                pages=pages,
+                start_page=pages[0],
+                end_page=pages[-1],
+                char_count=len(text),
+                sentence_count=len(emitted_sentences),
+            )
+        )
+
+    return output

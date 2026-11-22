@@ -14,6 +14,9 @@ from extraction.semantic_chunk import (
     detect_semantic_boundaries,
     resolve_device,
     SemanticBoundary,
+    SemanticChunk,
+    build_semantic_chunks,
+    _overlap_sentences,
     split_into_sentences,
 )
 
@@ -405,6 +408,181 @@ class SemanticBoundaryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "finite values"):
             detect_semantic_boundaries([similarity], 0.72)
+
+
+class SemanticChunkBuilderTests(unittest.TestCase):
+    def make_sentence(self, index, text, page=None):
+        return SentenceRecord(
+            source="20624.pdf",
+            page=page if page is not None else (1 + index // 2),
+            sentence_index=index,
+            text=text,
+        )
+
+    def make_boundary(self, first, second, score=0.50):
+        return SemanticBoundary(
+            first_sentence=first,
+            second_sentence=second,
+            score=score,
+            threshold=0.72,
+        )
+
+    def test_empty_sentences_return_no_chunks(self):
+        chunks = build_semantic_chunks([], [], 400, 700, 100)
+
+        self.assertEqual(chunks, [])
+
+    def test_boundary_is_delayed_below_minimum_size(self):
+        sentences = [
+            self.make_sentence(0, "A" * 100),
+            self.make_sentence(1, "B" * 100),
+            self.make_sentence(2, "C" * 100),
+        ]
+
+        boundary = self.make_boundary(sentences[0], sentences[1])
+        chunks = build_semantic_chunks(
+            sentences,
+            [boundary],
+            min_size=250,
+            max_size=400,
+            overlap=0,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(
+            chunks[0].text,
+            "A" * 100 + " " + "B" * 100 + " " + "C" * 100,
+        )
+
+    def test_semantic_boundary_splits_a_sufficient_chunk(self):
+        sentences = [
+            self.make_sentence(0, "A" * 200),
+            self.make_sentence(1, "B" * 200),
+            self.make_sentence(2, "C" * 400),
+        ]
+
+        boundary = self.make_boundary(sentences[1], sentences[2])
+        chunks = build_semantic_chunks(
+            sentences,
+            [boundary],
+            min_size=400,
+            max_size=700,
+            overlap=0,
+        )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0].char_count, 401)
+        self.assertEqual(chunks[1].char_count, 400)
+
+    def test_max_size_uses_the_best_available_boundary(self):
+        sentences = [
+            self.make_sentence(0, "A" * 250),
+            self.make_sentence(1, "B" * 250),
+            self.make_sentence(2, "C" * 250),
+        ]
+
+        boundaries = [
+            self.make_boundary(sentences[0], sentences[1], 0.40),
+            self.make_boundary(sentences[1], sentences[2], 0.20),
+        ]
+        chunks = build_semantic_chunks(
+            sentences,
+            boundaries,
+            min_size=400,
+            max_size=700,
+            overlap=0,
+        )
+
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertLessEqual(chunks[0].char_count, 700)
+        self.assertLessEqual(chunks[1].char_count, 700)
+
+    def test_no_boundary_falls_back_to_phrase_boundary(self):
+        sentences = [
+            self.make_sentence(0, "A" * 250),
+            self.make_sentence(1, "B" * 250),
+            self.make_sentence(2, "C" * 100),
+        ]
+
+        chunks = build_semantic_chunks(
+            sentences,
+            [],
+            min_size=400,
+            max_size=500,
+            overlap=0,
+        )
+
+        self.assertGreaterEqual(len(chunks), 2)
+        for chunk in chunks:
+            self.assertNotIn("\n", chunk.text)
+
+    def test_individual_sentence_over_max_size_is_not_split(self):
+        sentence = self.make_sentence(0, "A" * 800)
+
+        chunks = build_semantic_chunks(
+            [sentence],
+            [],
+            min_size=400,
+            max_size=700,
+            overlap=0,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].text, "A" * 800)
+        self.assertEqual(chunks[0].char_count, 800)
+
+    def test_preserves_pages_and_creates_unique_deterministic_ids(self):
+        sentences = [
+            self.make_sentence(0, "A" * 200, page=1),
+            self.make_sentence(1, "B" * 200, page=2),
+            self.make_sentence(2, "C" * 400, page=3),
+        ]
+        boundary = self.make_boundary(sentences[1], sentences[2])
+
+        first_run = build_semantic_chunks(
+            sentences,
+            [boundary],
+            min_size=400,
+            max_size=700,
+            overlap=50,
+        )
+        second_run = build_semantic_chunks(
+            sentences,
+            [boundary],
+            min_size=400,
+            max_size=700,
+            overlap=50,
+        )
+
+        first_ids = [chunk.chunk_id for chunk in first_run]
+        second_ids = [chunk.chunk_id for chunk in second_run]
+
+        self.assertEqual(first_ids, second_ids)
+        self.assertEqual(len(first_ids), len(set(first_ids)))
+        self.assertTrue(all(
+            chunk.source == "20624.pdf"
+            for chunk in first_run
+        ))
+        self.assertEqual(first_run[0].start_page, 1)
+        self.assertEqual(first_run[0].end_page, 2)
+
+    def test_overlap_uses_complete_sentences(self):
+        sentences = [
+            self.make_sentence(0, "A" * 120),
+            self.make_sentence(1, "B" * 120),
+            self.make_sentence(2, "C" * 120),
+        ]
+        overlap = _overlap_sentences(sentences[:2], overlap=150)
+
+        self.assertEqual(len(overlap), 1)
+        self.assertEqual(overlap[0].text, "B" * 120)
+
+    def test_invalid_size_configuration_is_rejected(self):
+        sentence = self.make_sentence(0, "Phrase")
+
+        with self.assertRaisesRegex(ValueError, "min_size"):
+            build_semantic_chunks([sentence], [], 700, 400, 100)
 
 
 if __name__ == "__main__":
