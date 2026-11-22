@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import argparse
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +16,7 @@ import numpy as np
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_PATH = BASE_DIR / "extraction" / "extracted_pages.jsonl"
 DEFAULT_CONFIG_PATH = BASE_DIR / "configs" / "semantic_chunking.yaml"
+LOGGER = logging.getLogger("semantic_chunk")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +94,15 @@ class SemanticChunk:
     end_page: int
     char_count: int
     sentence_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineStats:
+    documents: int = 0
+    sentences: int = 0
+    chunks: int = 0
+    empty_documents: int = 0
+    errors: int = 0
 
 
 def read_page_records(
@@ -701,3 +713,342 @@ def build_semantic_chunks(
         )
 
     return output
+
+
+def _semantic_chunk_to_record(chunk: SemanticChunk) -> dict[str, Any]:
+    return {
+        "chunk_id": chunk.chunk_id,
+        "source": chunk.source,
+        "text": chunk.text,
+        "pages": chunk.pages,
+        "start_page": chunk.start_page,
+        "end_page": chunk.end_page,
+        "char_count": chunk.char_count,
+        "sentence_count": chunk.sentence_count,
+    }
+
+
+def _validate_pipeline_config(config: dict[str, Any]) -> tuple[
+    str,
+    str,
+    float,
+    int,
+    int,
+    int,
+    int,
+]:
+    model_name = config.get("model_name")
+    device = config.get("device")
+
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model_name must be a non-empty string")
+    if not isinstance(device, str):
+        raise ValueError("device must be a string")
+
+    similarity_threshold = config.get("similarity_threshold")
+    min_size = config.get("min_size")
+    max_size = config.get("max_size")
+    overlap = config.get("overlap")
+    batch_size = config.get("batch_size")
+
+    numeric_config = {
+        "similarity_threshold": similarity_threshold,
+        "min_size": min_size,
+        "max_size": max_size,
+        "overlap": overlap,
+        "batch_size": batch_size,
+    }
+
+    for name, value in numeric_config.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be numeric")
+
+    threshold = float(similarity_threshold)
+    if not np.isfinite(threshold) or threshold < -1.0 or threshold > 1.0:
+        raise ValueError("similarity_threshold must be a finite value from -1 to 1")
+
+    min_size_int = int(min_size)
+    max_size_int = int(max_size)
+    overlap_int = int(overlap)
+    batch_size_int = int(batch_size)
+
+    if float(min_size) != min_size_int:
+        raise ValueError("min_size must be an integer")
+    if float(max_size) != max_size_int:
+        raise ValueError("max_size must be an integer")
+    if float(overlap) != overlap_int:
+        raise ValueError("overlap must be an integer")
+    if float(batch_size) != batch_size_int:
+        raise ValueError("batch_size must be an integer")
+    if min_size_int < 0 or max_size_int <= 0:
+        raise ValueError("min_size and max_size must be positive or zero")
+    if min_size_int > max_size_int:
+        raise ValueError("min_size must be less than or equal to max_size")
+    if overlap_int < 0:
+        raise ValueError("overlap must be greater than or equal to 0")
+    if overlap_int >= max_size_int:
+        raise ValueError("overlap must be smaller than max_size")
+    if batch_size_int < 1:
+        raise ValueError("batch_size must be greater than or equal to 1")
+
+    return (
+        model_name,
+        device,
+        threshold,
+        min_size_int,
+        max_size_int,
+        overlap_int,
+        batch_size_int,
+    )
+
+
+def _split_document_pages(
+    source_pages: list[PageRecord],
+) -> list[SentenceRecord]:
+    page_order = sorted(source_pages, key=lambda record: record.page)
+    sentences: list[SentenceRecord] = []
+
+    for page in page_order:
+        page_sentences = split_into_sentences(page)
+
+        for sentence in page_sentences:
+            sentences.append(
+                SentenceRecord(
+                    source=sentence.source,
+                    page=sentence.page,
+                    sentence_index=len(sentences),
+                    text=sentence.text,
+                )
+            )
+
+    return sentences
+
+
+def _write_chunk(output_file: Any, chunk: SemanticChunk) -> None:
+    record = _semantic_chunk_to_record(chunk)
+    output_file.write(
+        json.dumps(record, ensure_ascii=False) + "\n"
+    )
+    output_file.flush()
+
+
+def run_semantic_chunking(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    input_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    embedder: BGE3Embedder | None = None,
+) -> PipelineStats:
+    """Run the complete semantic chunking pipeline incrementally."""
+    config = load_semantic_chunking_config(config_path)
+    (
+        model_name,
+        device,
+        threshold,
+        min_size,
+        max_size,
+        overlap,
+        batch_size,
+    ) = _validate_pipeline_config(config)
+
+    resolved_input = (
+        input_path
+        if input_path is not None
+        else config["input_path"]
+    )
+    resolved_output = (
+        output_path
+        if output_path is not None
+        else config["output_path"]
+    )
+
+    input_file = Path(resolved_input)
+    if not input_file.is_absolute():
+        input_file = BASE_DIR / input_file
+
+    output_file = Path(resolved_output)
+    if not output_file.is_absolute():
+        output_file = BASE_DIR / output_file
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    documents = 0
+    sentence_count = 0
+    chunk_count = 0
+    empty_documents = 0
+    error_count = 0
+
+    seen_sources: set[str] = set()
+    active_source: str | None = None
+    active_pages: list[PageRecord] = []
+
+    def process_active_document(
+        output_stream: Any,
+    ) -> tuple[int, int, int]:
+        nonlocal embedder
+
+        if active_source is None:
+            return 0, 0, 0
+
+        sentences = _split_document_pages(active_pages)
+        if not sentences:
+            LOGGER.warning(
+                "Document '%s' contains no usable sentences",
+                active_source,
+            )
+            return 0, 0, 1
+
+        if embedder is None:
+            embedder = BGE3Embedder(
+                model_name=model_name,
+                device=device,
+                batch_size=batch_size,
+            )
+
+        sentence_embeddings = embedder.embed_sentences(sentences)
+        similarities = calculate_consecutive_similarities(sentence_embeddings)
+        boundaries = detect_semantic_boundaries(similarities, threshold)
+        chunks = build_semantic_chunks(
+            sentences,
+            boundaries,
+            min_size,
+            max_size,
+            overlap,
+        )
+
+        for chunk in chunks:
+            _write_chunk(output_stream, chunk)
+
+        LOGGER.info(
+            "Document '%s': %d sentences, %d chunks",
+            active_source,
+            len(sentences),
+            len(chunks),
+        )
+
+        return len(sentences), len(chunks), 0
+
+    with output_file.open("w", encoding="utf-8") as output_stream:
+        try:
+            for page in read_page_records(input_file):
+                if active_source is None:
+                    active_source = page.source
+
+                if page.source != active_source:
+                    documents += 1
+
+                    try:
+                        sentences_added, chunks_added, empty_added = (
+                            process_active_document(output_stream)
+                        )
+                        sentence_count += sentences_added
+                        chunk_count += chunks_added
+                        empty_documents += empty_added
+                    except Exception as exc:
+                        error_count += 1
+                        LOGGER.exception(
+                            "Error processing document '%s': %s",
+                            active_source,
+                            exc,
+                        )
+
+                    seen_sources.add(active_source)
+                    active_source = page.source
+                    active_pages = []
+
+                    if page.source in seen_sources:
+                        raise ValueError(
+                            "Extracted pages must be grouped contiguously "
+                            f"by source; source '{page.source}' appeared again"
+                        )
+
+                active_pages.append(page)
+        except Exception as exc:
+            error_count += 1
+            LOGGER.exception("Pipeline input error: %s", exc)
+            raise
+
+        if active_source is not None:
+            documents += 1
+
+            try:
+                sentences_added, chunks_added, empty_added = (
+                    process_active_document(output_stream)
+                )
+                sentence_count += sentences_added
+                chunk_count += chunks_added
+                empty_documents += empty_added
+            except Exception as exc:
+                error_count += 1
+                LOGGER.exception(
+                    "Error processing document '%s': %s",
+                    active_source,
+                    exc,
+                )
+
+    if documents == 0:
+        LOGGER.warning("No extracted page records were found")
+
+    stats = PipelineStats(
+        documents=documents,
+        sentences=sentence_count,
+        chunks=chunk_count,
+        empty_documents=empty_documents,
+        errors=error_count,
+    )
+
+    LOGGER.info(
+        "Semantic chunking complete: %d documents, %d sentences, "
+        "%d chunks, %d empty documents, %d errors",
+        stats.documents,
+        stats.sentences,
+        stats.chunks,
+        stats.empty_documents,
+        stats.errors,
+    )
+
+    return stats
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build semantic chunks with BGE-M3 embeddings",
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to the semantic chunking YAML configuration",
+    )
+    parser.add_argument(
+        "--input",
+        default=None,
+        help="Optional override for the extracted-page JSONL path",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional override for the semantic chunk JSONL path",
+    )
+    return parser
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    args = build_argument_parser().parse_args()
+
+    try:
+        stats = run_semantic_chunking(
+            config_path=args.config,
+            input_path=args.input,
+            output_path=args.output,
+        )
+        return 1 if stats.errors > 0 else 0
+    except Exception as exc:
+        LOGGER.exception("Semantic chunking failed: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

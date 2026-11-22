@@ -1,4 +1,7 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -17,6 +20,7 @@ from extraction.semantic_chunk import (
     SemanticChunk,
     build_semantic_chunks,
     _overlap_sentences,
+    run_semantic_chunking,
     split_into_sentences,
 )
 
@@ -583,6 +587,158 @@ class SemanticChunkBuilderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "min_size"):
             build_semantic_chunks([sentence], [], 700, 400, 100)
+
+
+class MockPipelineEmbedder:
+    def __init__(self):
+        self.calls = []
+
+    def embed_sentences(self, sentences):
+        self.calls.append(sentences)
+        embeddings = []
+
+        for sentence in sentences:
+            embeddings.append(
+                SentenceEmbedding(
+                    sentence=sentence,
+                    embedding=np.asarray(
+                        [1.0 if sentence.sentence_index % 2 == 0 else 0.0,
+                         0.0 if sentence.sentence_index % 2 == 0 else 1.0],
+                        dtype=np.float32,
+                    ),
+                )
+            )
+
+        return embeddings
+
+
+class SemanticPipelineIntegrationTests(unittest.TestCase):
+    def make_config(self, directory):
+        config_path = directory / "semantic.yaml"
+        config_path.write_text(
+            "\n".join([
+                "model_name: BAAI/bge-m3",
+                "similarity_threshold: 0.72",
+                "min_size: 10",
+                "max_size: 100",
+                "overlap: 10",
+                "batch_size: 2",
+                "device: cpu",
+                "input_path: pages.jsonl",
+                "output_path: semantic.jsonl",
+            ]),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def test_pipeline_writes_valid_jsonl_with_document_separation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            config_path = self.make_config(directory)
+            input_path = directory / "pages.jsonl"
+            output_path = directory / "semantic.jsonl"
+
+            input_path.write_text(
+                "\n".join([
+                    json.dumps({
+                        "source": "a.pdf",
+                        "page": 1,
+                        "text": "Première phrase. Deuxième phrase.",
+                    }, ensure_ascii=False),
+                    json.dumps({
+                        "source": "a.pdf",
+                        "page": 2,
+                        "text": "Troisième phrase!",
+                    }, ensure_ascii=False),
+                    json.dumps({
+                        "source": "b.pdf",
+                        "page": 1,
+                        "text": "تم قبول الاستئناف؟ الحكم صالح.",
+                    }, ensure_ascii=False),
+                ]),
+                encoding="utf-8",
+            )
+
+            embedder = MockPipelineEmbedder()
+            stats = run_semantic_chunking(
+                config_path=config_path,
+                input_path=input_path,
+                output_path=output_path,
+                embedder=embedder,
+            )
+
+            lines = [
+                json.loads(line)
+                for line in output_path.read_text(
+                    encoding="utf-8",
+                ).splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(stats.documents, 2)
+            self.assertGreater(stats.sentences, 0)
+            self.assertEqual(stats.chunks, len(lines))
+            self.assertEqual(stats.errors, 0)
+            self.assertEqual(
+                len(embedder.calls),
+                2,
+                "Each document should be embedded separately",
+            )
+
+            sources = {record["source"] for record in lines}
+            self.assertEqual(sources, {"a.pdf", "b.pdf"})
+            for record in lines:
+                self.assertIn("chunk_id", record)
+                self.assertIn("pages", record)
+                self.assertIn("start_page", record)
+                self.assertIn("end_page", record)
+                self.assertGreaterEqual(
+                    record["start_page"],
+                    min(record["pages"]),
+                )
+                self.assertLessEqual(
+                    record["end_page"],
+                    max(record["pages"]),
+                )
+
+    def test_pipeline_rejects_interleaved_sources(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            config_path = self.make_config(directory)
+            input_path = directory / "pages.jsonl"
+            output_path = directory / "semantic.jsonl"
+
+            input_path.write_text(
+                "\n".join([
+                    json.dumps({
+                        "source": "a.pdf",
+                        "page": 1,
+                        "text": "Première phrase.",
+                    }),
+                    json.dumps({
+                        "source": "b.pdf",
+                        "page": 1,
+                        "text": "Autre phrase.",
+                    }),
+                    json.dumps({
+                        "source": "a.pdf",
+                        "page": 2,
+                        "text": "Dernière phrase.",
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "must be grouped contiguously",
+            ):
+                run_semantic_chunking(
+                    config_path=config_path,
+                    input_path=input_path,
+                    output_path=output_path,
+                    embedder=MockPipelineEmbedder(),
+                )
 
 
 if __name__ == "__main__":
