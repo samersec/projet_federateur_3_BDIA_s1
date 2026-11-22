@@ -1,0 +1,9 @@
+model_name: BAAI/bge-m3
+similarity_threshold: 0.72
+min_size: 400
+max_size: 700
+overlap: 100
+batch_size: 16
+device: auto
+input_path: extraction/extracted_pages.jsonl
+output_path: data/interim/semantic_chunks.jsonl
