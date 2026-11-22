@@ -1,0 +1,31 @@
+
+project:
+  name: TunCase AI
+  project_version: "0.1.0"
+
+dataset:
+  name: tunisian_commercial_cassation
+  source: official_court_documents
+  documents_count: 120
+  language: Arabic
+
+chunking:
+  strategy: recursive
+  version: "1.0.0"
+
+  chunk_size: 700
+  chunk_overlap: 120
+
+  separators:
+    - "\n\n"
+    - "\n"
+    - "؟"
+    - "؛"
+    - "."
+    - " "
+
+  length_unit: characters
+
+tracking:
+  experiment_name: "TunCase_Chunking"
+  framework: mlflow

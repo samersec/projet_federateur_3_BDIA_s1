@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# MLflow local artifacts
+mlruns/
+
+# Generated datasets
+data/processed/
+data/interim/
+data/raw/
+
+# Generated experiments
+experiments/
+
+# Reports generated
+reports/metrics/
+reports/comparisons/
+
+# Temporary files
+temp/
+tmp/

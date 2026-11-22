@@ -1,0 +1,23 @@
+experiment_id: recursive_v1
+strategy: recursive
+
+dataset:
+  path: data/interim/extracted_pages.jsonl
+  id: tun_case_corpus_v1
+
+chunking:
+  chunk_size: 700
+  chunk_overlap: 120
+  unit: characters
+
+  separators:
+    - "\n\n"
+    - "\n"
+    - "؟"
+    - "؛"
+    - "."
+    - " "
+    - ""
+
+output:
+  path: data/processed/recursive_v1/chunks.jsonl
